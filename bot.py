@@ -526,16 +526,41 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result["warning"]:
             caption += f"\n⚠️ {result['warning']}"
 
-        # document ke roop me bhejte hain taaki file name bilkul wahi rahe
-        with open(result["path"], "rb") as fh:
-            await message.reply_document(
-                document=fh,
-                filename=result["name"],
-                caption=caption[:1000],
-                read_timeout=120,
-                write_timeout=120,
-                connect_timeout=30,
-            )
+        # Audio ke roop me bhejo (player + title/artist/cover thumbnail).
+        # Agar Telegram audio reject kare (jaise odd format), to document fallback.
+        duration = None
+        try:
+            mf = MutagenFile(result["path"])
+            if mf is not None and mf.info is not None:
+                duration = int(mf.info.length)
+        except Exception:
+            pass
+
+        send_kwargs = dict(
+            caption=caption[:1000],
+            read_timeout=120,
+            write_timeout=120,
+            connect_timeout=30,
+        )
+        try:
+            with open(result["path"], "rb") as fh, open(ALPHA_COVER_IMAGE, "rb") as thumb:
+                await message.reply_audio(
+                    audio=fh,
+                    filename=result["name"],
+                    title=result["title"],
+                    performer=ALPHA_ARTIST_NAME,
+                    duration=duration,
+                    thumbnail=thumb,
+                    **send_kwargs,
+                )
+        except TelegramError as audio_err:
+            log.warning("reply_audio failed (%s), document fallback", audio_err)
+            with open(result["path"], "rb") as fh:
+                await message.reply_document(
+                    document=fh,
+                    filename=result["name"],
+                    **send_kwargs,
+                )
 
         try:
             await status.delete()
