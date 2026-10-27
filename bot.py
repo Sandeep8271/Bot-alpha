@@ -21,6 +21,13 @@ import logging
 import asyncio
 import tempfile
 import subprocess
+import threading
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass  # .env nahi padhega, sirf system env vars chalenge
 
 from mutagen import File as MutagenFile
 from mutagen.id3 import ID3, ID3NoHeaderError, APIC, TPE1, TPE2, TALB, TIT2
@@ -73,6 +80,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+# httpx har request ka poora URL (token ke saath) INFO me print karta hai -> band
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("alpha-bot")
 
 
@@ -548,16 +558,52 @@ async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Audio file bhejo 🎧 (/start dekho)")
 
 
+def start_health_server():
+    """Render Web Service ko $PORT par open port chahiye, warna instance kill/restart hota hai."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _ok(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+
+        def do_GET(self):
+            self._ok()
+            self.wfile.write(b"alpha bot ok")
+
+        def do_HEAD(self):
+            self._ok()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("0.0.0.0", int(port)), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health server listening on port %s", port)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN set nahi hai. Example: BOT_TOKEN=123:ABC python bot.py")
     if not os.path.exists(ALPHA_COVER_IMAGE):
         log.warning("cover.jpg nahi mili: %s (tagging fail hogi)", ALPHA_COVER_IMAGE)
 
+    start_health_server()
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_connect_timeout(30)
+        .get_updates_read_timeout(30)
         .build()
     )
 
@@ -566,7 +612,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_other))
 
     log.info("Alpha bot running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
