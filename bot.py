@@ -38,7 +38,7 @@ from mutagen.oggvorbis import OggVorbis
 from mutagen.oggopus import OggOpus
 
 from telegram import Update
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -556,6 +556,46 @@ def _pick_file(message):
     return None
 
 
+# Ek saath kitni files (sab users mila kar) process ho sakti hain.
+MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "2"))
+_global_sem = None
+_chat_locks = {}
+
+
+def _get_sem():
+    global _global_sem
+    if _global_sem is None:
+        _global_sem = asyncio.Semaphore(MAX_PARALLEL)
+    return _global_sem
+
+
+def _get_chat_lock(chat_id):
+    if len(_chat_locks) > 1000:
+        for k in [k for k, v in _chat_locks.items() if not v.locked()]:
+            _chat_locks.pop(k, None)
+    lock = _chat_locks.get(chat_id)
+    if lock is None:
+        lock = _chat_locks[chat_id] = asyncio.Lock()
+    return lock
+
+
+async def tg_retry(factory, tries=4):
+    """Telegram flood-limit (RetryAfter) / timeout par wait karke dobara try."""
+    for attempt in range(tries):
+        try:
+            return await factory()
+        except RetryAfter as e:
+            if attempt == tries - 1:
+                raise
+            wait = float(getattr(e.retry_after, "total_seconds", lambda: e.retry_after)())
+            log.warning("flood control: %.0fs wait", wait)
+            await asyncio.sleep(wait + 1)
+        except TimedOut:
+            if attempt == tries - 1:
+                raise
+            await asyncio.sleep(2)
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
@@ -566,89 +606,113 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tg_obj, file_name, size = picked
+    chat_id = message.chat_id
+    thread_id = message.message_thread_id if message.is_topic_message else None
 
     if size and size > TG_DOWNLOAD_LIMIT:
-        await message.reply_text(
-            f"❌ `{file_name}` {size / 1024 / 1024:.1f} MB hai. "
-            "Telegram bot 20 MB se badi file download nahi kar sakta.",
-            parse_mode="Markdown",
-        )
+        await tg_retry(lambda: message.reply_text(
+            f"❌ {file_name} {size / 1024 / 1024:.1f} MB hai. "
+            "Telegram bot 20 MB se badi file download nahi kar sakta."))
         return
 
-    status = await message.reply_text(f"⏳ Processing: {file_name}")
-    work_dir = tempfile.mkdtemp(prefix="alpha_")
+    status = await tg_retry(lambda: context.bot.send_message(
+        chat_id, f"🕐 Queue me: {file_name}", message_thread_id=thread_id))
 
-    try:
-        tg_file = await tg_obj.get_file()
-        raw_path = os.path.join(work_dir, "raw_input")
-        await tg_file.download_to_drive(raw_path)
+    # Ek chat ki files line se (order me), sab chats mila kar MAX_PARALLEL tak.
+    async with _get_chat_lock(chat_id):
+        async with _get_sem():
+            work_dir = tempfile.mkdtemp(prefix="alpha_")
+            try:
+                try:
+                    await status.edit_text(f"⏳ Processing: {file_name}")
+                except TelegramError:
+                    pass
 
-        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
-            raise RuntimeError("Download khali (0 bytes) aaya")
+                tg_file = await tg_retry(lambda: tg_obj.get_file())
+                raw_path = os.path.join(work_dir, "raw_input")
+                await tg_retry(lambda: tg_file.download_to_drive(raw_path))
 
-        result = await asyncio.to_thread(process_audio, raw_path, file_name, work_dir)
+                if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+                    raise RuntimeError("Download khali (0 bytes) aaya")
 
-        src_label = ("metadata ka original title"
-                     if result["source"] == "metadata"
-                     else "file name se banaya gaya title")
-        caption = f"✅ {result['title']}\n({src_label})"
-        caption += "\ncover: " + ("✅ embedded" if result["cover_ok"] else "❌ file me nahi")
-        if result["ext_fixed"]:
-            caption += f"\nextension fixed → {result['ext']}"
-        if result["warning"]:
-            caption += f"\n⚠️ {result['warning']}"
+                result = await asyncio.to_thread(process_audio, raw_path, file_name, work_dir)
 
-        # Audio ke roop me bhejo (player + title/artist/cover thumbnail).
-        # Agar Telegram audio reject kare (jaise odd format), to document fallback.
-        duration = None
-        try:
-            mf = MutagenFile(result["path"])
-            if mf is not None and mf.info is not None:
-                duration = int(mf.info.length)
-        except Exception:
-            pass
+                src_label = ("metadata ka original title"
+                             if result["source"] == "metadata"
+                             else "file name se banaya gaya title")
+                caption = f"✅ {result['title']}\n({src_label})"
+                caption += "\ncover: " + ("✅ embedded" if result["cover_ok"] else "❌ file me nahi")
+                if result["ext_fixed"]:
+                    caption += f"\nextension fixed → {result['ext']}"
+                if result["warning"]:
+                    caption += f"\n⚠️ {result['warning']}"
 
-        send_kwargs = dict(
-            caption=caption[:1000],
-            read_timeout=120,
-            write_timeout=120,
-            connect_timeout=30,
-        )
-        thumb_bytes = get_thumbnail_bytes() or None
-        try:
-            with open(result["path"], "rb") as fh:
-                await message.reply_audio(
-                    audio=fh,
-                    filename=result["name"],
-                    title=result["title"],
-                    performer=ALPHA_ARTIST_NAME,
-                    duration=duration,
-                    thumbnail=thumb_bytes,
-                    **send_kwargs,
+                duration = None
+                try:
+                    mf = MutagenFile(result["path"])
+                    if mf is not None and mf.info is not None:
+                        duration = int(mf.info.length)
+                except Exception:
+                    pass
+
+                send_kwargs = dict(
+                    chat_id=chat_id,
+                    caption=caption[:1000],
+                    message_thread_id=thread_id,
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
                 )
-        except TelegramError as audio_err:
-            log.warning("reply_audio failed (%s), document fallback", audio_err)
-            with open(result["path"], "rb") as fh:
-                await message.reply_document(
-                    document=fh,
-                    filename=result["name"],
-                    thumbnail=thumb_bytes,
-                    **send_kwargs,
-                )
+                thumb_bytes = get_thumbnail_bytes() or None
 
-        try:
-            await status.delete()
-        except TelegramError:
-            pass
+                async def send_audio_once():
+                    with open(result["path"], "rb") as fh:
+                        return await context.bot.send_audio(
+                            audio=fh,
+                            filename=result["name"],
+                            title=result["title"],
+                            performer=ALPHA_ARTIST_NAME,
+                            duration=duration,
+                            thumbnail=thumb_bytes,
+                            **send_kwargs,
+                        )
 
-    except Exception as e:
-        log.exception("processing failed")
-        try:
-            await status.edit_text(f"❌ Error ({file_name}): {e}")
-        except TelegramError:
-            pass
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
+                async def send_document_once():
+                    with open(result["path"], "rb") as fh:
+                        return await context.bot.send_document(
+                            document=fh,
+                            filename=result["name"],
+                            thumbnail=thumb_bytes,
+                            **send_kwargs,
+                        )
+
+                # Audio ke roop me; Telegram reject kare to document fallback
+                try:
+                    await tg_retry(send_audio_once)
+                except (RetryAfter, TimedOut):
+                    raise
+                except TelegramError as audio_err:
+                    log.warning("send_audio failed (%s), document fallback", audio_err)
+                    await tg_retry(send_document_once)
+
+                # Sirf success ke baad: status + user ka original message hatao
+                try:
+                    await status.delete()
+                except TelegramError:
+                    pass
+                try:
+                    await message.delete()
+                except TelegramError as del_err:
+                    log.info("user message delete nahi hua: %s", del_err)
+
+            except Exception as e:
+                log.exception("processing failed")
+                try:
+                    await status.edit_text(f"❌ Error ({file_name}): {e}")
+                except TelegramError:
+                    pass
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -701,6 +765,7 @@ def main():
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
+        .connection_pool_size(32)
         .get_updates_connect_timeout(30)
         .get_updates_read_timeout(30)
         .build()
