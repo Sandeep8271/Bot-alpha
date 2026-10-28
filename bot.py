@@ -109,21 +109,21 @@ def clean_filename(name):
 
 
 def fix_ep_title(name):
-    """Sirf file-name se bane title par lagta hai (Ep_12 -> Ep 12)."""
-    name = name.strip()
-
+    """Kisi bhi naam ko 'Ep 1418 - Title' format me laata hai.
+    - '11/23: Ep 1418 - xyz', 'Ep_1418_xyz', 'episode1418 xyz' sab handle.
+    - Ep se pehle ka kachra (date, emoji) hata deta hai.
+    - Ep number nahi mila to naam waisa hi (sirf _ -> space)."""
+    name = (name or "").strip()
     if "_" in name and " " not in name:
         name = name.replace("_", " ")
 
-    m = re.match(r"^(Ep(?:i(?:sode)?)?)[\s._\-]+(\d+)(.*)$", name, re.IGNORECASE)
-    if m:
-        return f"Ep {m.group(2)}{m.group(3)}"
-
-    m = re.match(r"^(Ep(?:i(?:sode)?)?)(\d+)(.*)$", name, re.IGNORECASE)
-    if m:
-        return f"Ep {m.group(2)}{m.group(3)}"
-
-    return name
+    m = re.search(r"(?<![A-Za-z])(?:Ep(?:i(?:sode)?)?)[\s._\-]*(\d+)(.*)$",
+                  name, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return name
+    num, rest = m.group(1), m.group(2)
+    rest = re.sub(r"^[\s._\-\u2013\u2014:|]+", "", rest).strip()
+    return f"Ep {num} - {rest}" if rest else f"Ep {num}"
 
 
 # =====================================================
@@ -486,7 +486,7 @@ def process_audio(src_path, original_name, work_dir):
 
     title, source = decide_title(src_path, ext, original_name)
 
-    out_name = (clean_filename(title) or "audio") + ext
+    out_name = (clean_filename(fix_ep_title(title)) or "audio") + ext
     out_path = os.path.join(work_dir, out_name)
     os.replace(src_path, out_path)
 
@@ -591,6 +591,19 @@ def _spawn(coro):
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
     return task
+
+
+def ep_number(name):
+    """Naam me se Ep number (Ep 5, Ep_5, episode5, 11/23: Ep 1418 ...) ya None."""
+    m = re.search(r"(?<![A-Za-z])(?:Ep(?:i(?:sode)?)?)[\s._\-]*(\d+)", name or "", re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def batch_sort_key(item):
+    """Pehle Ep number se (1,2,3...12), jin me number nahi unhe baad me natural order me."""
+    name = item["file_name"]
+    n = ep_number(name)
+    return (0 if n is not None else 1, n or 0, natural_key(name), item["message"].message_id)
 
 
 def natural_key(name):
@@ -703,7 +716,7 @@ async def _process_item(context, item):
 
 async def _run_batch(chat_id, items, context, thread_id):
     # Ep number ke hisaab se serial: Ep 1, Ep 2, ... Ep 10 (tie par arrival order)
-    items.sort(key=lambda it: (natural_key(it["file_name"]), it["message"].message_id))
+    items.sort(key=batch_sort_key)
     total = len(items)
 
     async with _get_chat_lock(chat_id):
