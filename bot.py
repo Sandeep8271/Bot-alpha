@@ -22,6 +22,7 @@ import asyncio
 import tempfile
 import subprocess
 import threading
+import time
 import io
 
 try:
@@ -556,10 +557,16 @@ def _pick_file(message):
     return None
 
 
-# Ek saath kitni files (sab users mila kar) process ho sakti hain.
+# Ek saath kitne batches (sab users mila kar) process ho sakte hain.
 MAX_PARALLEL = int(os.environ.get("MAX_PARALLEL", "2"))
+# Files aate rahe to itni der (sec) ruk kar batch band karte hain, phir sort + process.
+BATCH_WAIT = float(os.environ.get("BATCH_WAIT", "3"))
+BATCH_MAX_WAIT = float(os.environ.get("BATCH_MAX_WAIT", "20"))
+
 _global_sem = None
 _chat_locks = {}
+_batches = {}      # chat_id -> {"items": [...], "timer": Task, "first": float}
+_bg_tasks = set()  # tasks ko garbage-collect hone se bachane ke liye
 
 
 def _get_sem():
@@ -579,6 +586,18 @@ def _get_chat_lock(chat_id):
     return lock
 
 
+def _spawn(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+def natural_key(name):
+    """'Ep 2' < 'Ep 10' (numbers ko number ki tarah compare)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
 async def tg_retry(factory, tries=4):
     """Telegram flood-limit (RetryAfter) / timeout par wait karke dobara try."""
     for attempt in range(tries):
@@ -596,6 +615,145 @@ async def tg_retry(factory, tries=4):
             await asyncio.sleep(2)
 
 
+async def _process_item(context, item):
+    """Ek file: download -> process -> audio bhejo -> original delete. Error raise karta hai."""
+    message = item["message"]
+    tg_obj = item["tg_obj"]
+    file_name = item["file_name"]
+    chat_id = message.chat_id
+    thread_id = item["thread_id"]
+
+    work_dir = tempfile.mkdtemp(prefix="alpha_")
+    try:
+        tg_file = await tg_retry(lambda: tg_obj.get_file())
+        raw_path = os.path.join(work_dir, "raw_input")
+        await tg_retry(lambda: tg_file.download_to_drive(raw_path))
+
+        if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            raise RuntimeError("Download khali (0 bytes) aaya")
+
+        result = await asyncio.to_thread(process_audio, raw_path, file_name, work_dir)
+
+        src_label = ("metadata ka original title"
+                     if result["source"] == "metadata"
+                     else "file name se banaya gaya title")
+        caption = f"✅ {result['title']}\n({src_label})"
+        caption += "\ncover: " + ("✅ embedded" if result["cover_ok"] else "❌ file me nahi")
+        if result["ext_fixed"]:
+            caption += f"\nextension fixed → {result['ext']}"
+        if result["warning"]:
+            caption += f"\n⚠️ {result['warning']}"
+
+        duration = None
+        try:
+            mf = MutagenFile(result["path"])
+            if mf is not None and mf.info is not None:
+                duration = int(mf.info.length)
+        except Exception:
+            pass
+
+        send_kwargs = dict(
+            chat_id=chat_id,
+            caption=caption[:1000],
+            message_thread_id=thread_id,
+            read_timeout=120,
+            write_timeout=120,
+            connect_timeout=30,
+        )
+        thumb_bytes = get_thumbnail_bytes() or None
+
+        async def send_audio_once():
+            with open(result["path"], "rb") as fh:
+                return await context.bot.send_audio(
+                    audio=fh,
+                    filename=result["name"],
+                    title=result["title"],
+                    performer=ALPHA_ARTIST_NAME,
+                    duration=duration,
+                    thumbnail=thumb_bytes,
+                    **send_kwargs,
+                )
+
+        async def send_document_once():
+            with open(result["path"], "rb") as fh:
+                return await context.bot.send_document(
+                    document=fh,
+                    filename=result["name"],
+                    thumbnail=thumb_bytes,
+                    **send_kwargs,
+                )
+
+        # Audio ke roop me; Telegram reject kare to document fallback
+        try:
+            await tg_retry(send_audio_once)
+        except (RetryAfter, TimedOut):
+            raise
+        except TelegramError as audio_err:
+            log.warning("send_audio failed (%s), document fallback", audio_err)
+            await tg_retry(send_document_once)
+
+        # Sirf success ke baad user ka original message hatao
+        try:
+            await message.delete()
+        except TelegramError as del_err:
+            log.info("user message delete nahi hua: %s", del_err)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+async def _run_batch(chat_id, items, context, thread_id):
+    # Ep number ke hisaab se serial: Ep 1, Ep 2, ... Ep 10 (tie par arrival order)
+    items.sort(key=lambda it: (natural_key(it["file_name"]), it["message"].message_id))
+    total = len(items)
+
+    async with _get_chat_lock(chat_id):
+        async with _get_sem():
+            status = None
+            try:
+                status = await tg_retry(lambda: context.bot.send_message(
+                    chat_id, f"📥 {total} file serial me process hongi...",
+                    message_thread_id=thread_id))
+            except TelegramError:
+                pass
+
+            failed = []
+            for n, item in enumerate(items, 1):
+                name = item["file_name"]
+                if status:
+                    try:
+                        await status.edit_text(f"⏳ {n}/{total}: {name}")
+                    except TelegramError:
+                        pass
+                try:
+                    await _process_item(context, item)
+                except Exception as e:
+                    log.exception("processing failed: %s", name)
+                    failed.append((name, e))
+
+            if status:
+                try:
+                    await status.delete()
+                except TelegramError:
+                    pass
+            if failed:
+                lines = "\n".join(f"• {n}: {e}" for n, e in failed)
+                try:
+                    await tg_retry(lambda: context.bot.send_message(
+                        chat_id, f"❌ {len(failed)} file fail hui (original delete nahi kiya):\n{lines}"[:4000],
+                        message_thread_id=thread_id))
+                except TelegramError:
+                    pass
+
+
+async def _batch_timer(chat_id, delay, context):
+    await asyncio.sleep(delay)
+    batch = _batches.pop(chat_id, None)  # sync -> race-free
+    if not batch or not batch["items"]:
+        return
+    thread_id = batch["items"][0]["thread_id"]
+    _spawn(_run_batch(chat_id, batch["items"], context, thread_id))
+
+
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
@@ -607,7 +765,6 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_obj, file_name, size = picked
     chat_id = message.chat_id
-    thread_id = message.message_thread_id if message.is_topic_message else None
 
     if size and size > TG_DOWNLOAD_LIMIT:
         await tg_retry(lambda: message.reply_text(
@@ -615,104 +772,24 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Telegram bot 20 MB se badi file download nahi kar sakta."))
         return
 
-    status = await tg_retry(lambda: context.bot.send_message(
-        chat_id, f"🕐 Queue me: {file_name}", message_thread_id=thread_id))
+    item = {
+        "message": message,
+        "tg_obj": tg_obj,
+        "file_name": file_name,
+        "thread_id": message.message_thread_id if message.is_topic_message else None,
+    }
 
-    # Ek chat ki files line se (order me), sab chats mila kar MAX_PARALLEL tak.
-    async with _get_chat_lock(chat_id):
-        async with _get_sem():
-            work_dir = tempfile.mkdtemp(prefix="alpha_")
-            try:
-                try:
-                    await status.edit_text(f"⏳ Processing: {file_name}")
-                except TelegramError:
-                    pass
+    # Files ko batch me jama karo; aakhri file ke BATCH_WAIT sec baad sort karke chalao.
+    now = time.monotonic()
+    batch = _batches.get(chat_id)
+    if batch is None:
+        batch = _batches[chat_id] = {"items": [], "timer": None, "first": now}
+    batch["items"].append(item)
 
-                tg_file = await tg_retry(lambda: tg_obj.get_file())
-                raw_path = os.path.join(work_dir, "raw_input")
-                await tg_retry(lambda: tg_file.download_to_drive(raw_path))
-
-                if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
-                    raise RuntimeError("Download khali (0 bytes) aaya")
-
-                result = await asyncio.to_thread(process_audio, raw_path, file_name, work_dir)
-
-                src_label = ("metadata ka original title"
-                             if result["source"] == "metadata"
-                             else "file name se banaya gaya title")
-                caption = f"✅ {result['title']}\n({src_label})"
-                caption += "\ncover: " + ("✅ embedded" if result["cover_ok"] else "❌ file me nahi")
-                if result["ext_fixed"]:
-                    caption += f"\nextension fixed → {result['ext']}"
-                if result["warning"]:
-                    caption += f"\n⚠️ {result['warning']}"
-
-                duration = None
-                try:
-                    mf = MutagenFile(result["path"])
-                    if mf is not None and mf.info is not None:
-                        duration = int(mf.info.length)
-                except Exception:
-                    pass
-
-                send_kwargs = dict(
-                    chat_id=chat_id,
-                    caption=caption[:1000],
-                    message_thread_id=thread_id,
-                    read_timeout=120,
-                    write_timeout=120,
-                    connect_timeout=30,
-                )
-                thumb_bytes = get_thumbnail_bytes() or None
-
-                async def send_audio_once():
-                    with open(result["path"], "rb") as fh:
-                        return await context.bot.send_audio(
-                            audio=fh,
-                            filename=result["name"],
-                            title=result["title"],
-                            performer=ALPHA_ARTIST_NAME,
-                            duration=duration,
-                            thumbnail=thumb_bytes,
-                            **send_kwargs,
-                        )
-
-                async def send_document_once():
-                    with open(result["path"], "rb") as fh:
-                        return await context.bot.send_document(
-                            document=fh,
-                            filename=result["name"],
-                            thumbnail=thumb_bytes,
-                            **send_kwargs,
-                        )
-
-                # Audio ke roop me; Telegram reject kare to document fallback
-                try:
-                    await tg_retry(send_audio_once)
-                except (RetryAfter, TimedOut):
-                    raise
-                except TelegramError as audio_err:
-                    log.warning("send_audio failed (%s), document fallback", audio_err)
-                    await tg_retry(send_document_once)
-
-                # Sirf success ke baad: status + user ka original message hatao
-                try:
-                    await status.delete()
-                except TelegramError:
-                    pass
-                try:
-                    await message.delete()
-                except TelegramError as del_err:
-                    log.info("user message delete nahi hua: %s", del_err)
-
-            except Exception as e:
-                log.exception("processing failed")
-                try:
-                    await status.edit_text(f"❌ Error ({file_name}): {e}")
-                except TelegramError:
-                    pass
-            finally:
-                shutil.rmtree(work_dir, ignore_errors=True)
+    if batch["timer"] and not batch["timer"].done():
+        batch["timer"].cancel()
+    delay = max(0.5, min(BATCH_WAIT, BATCH_MAX_WAIT - (now - batch["first"])))
+    batch["timer"] = _spawn(_batch_timer(chat_id, delay, context))
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
