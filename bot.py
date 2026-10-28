@@ -22,6 +22,7 @@ import asyncio
 import tempfile
 import subprocess
 import threading
+import io
 
 try:
     from dotenv import load_dotenv
@@ -406,6 +407,65 @@ def apply_tags(path, ext, title):
 
 
 # =====================================================
+# TELEGRAM THUMBNAIL (max 320x320, JPEG baseline, <200KB)
+# =====================================================
+
+_THUMB_CACHE = None
+
+
+def get_thumbnail_bytes():
+    """cover.jpg ko 320x320 baseline JPEG me badalta hai (Telegram ki limit)."""
+    global _THUMB_CACHE
+    if _THUMB_CACHE is not None:
+        return _THUMB_CACHE
+    try:
+        from PIL import Image
+        im = Image.open(ALPHA_COVER_IMAGE).convert("RGB")
+        im.thumbnail((320, 320))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=85, progressive=False, optimize=False)
+        _THUMB_CACHE = buf.getvalue()
+    except Exception as e:
+        log.warning("thumbnail banane me error: %s", e)
+        _THUMB_CACHE = b""
+    return _THUMB_CACHE
+
+
+def cover_embedded(path, ext):
+    """Tag likhne ke baad check: file ke andar cover sach me hai?"""
+    try:
+        if ext == ".mp3":
+            return bool(ID3(path).getall("APIC"))
+        if ext in M4A_EXTS:
+            return bool((MP4(path).tags or {}).get("covr"))
+        if ext == ".flac":
+            return bool(FLAC(path).pictures)
+        if ext in (".ogg", ".opus"):
+            a = OggOpus(path) if ext == ".opus" else OggVorbis(path)
+            return bool(a.get("metadata_block_picture"))
+    except Exception:
+        return False
+    return False
+
+
+def wrap_aac_to_m4a(path):
+    """Raw ADTS .aac me cover tag nahi hota -> m4a container me copy (no re-encode)."""
+    ffmpeg = shutil.which(FFMPEG_PATH)
+    if not ffmpeg:
+        return None
+    out = os.path.splitext(path)[0] + ".wrap.m4a"
+    r = subprocess.run(
+        [ffmpeg, "-y", "-v", "error", "-i", path, "-map", "0:a", "-c:a", "copy",
+         "-f", "ipod", out],
+        capture_output=True, timeout=600)
+    if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+        return out
+    if os.path.exists(out):
+        os.remove(out)
+    return None
+
+
+# =====================================================
 # CORE PROCESSOR (blocking; bot isme thread se call karta hai)
 # =====================================================
 
@@ -416,6 +476,13 @@ def process_audio(src_path, original_name, work_dir):
     if ext not in AUDIO_EXTS:
         ext = ".mp3"
 
+    # raw .aac (ftyp nahi) -> m4a me wrap, warna cover/tags nahi lagte
+    if ext == ".aac" and not sniffed:
+        wrapped = wrap_aac_to_m4a(src_path)
+        if wrapped:
+            os.replace(wrapped, src_path)
+            ext = ".m4a"
+
     title, source = decide_title(src_path, ext, original_name)
 
     out_name = (clean_filename(title) or "audio") + ext
@@ -423,8 +490,12 @@ def process_audio(src_path, original_name, work_dir):
     os.replace(src_path, out_path)
 
     warning = apply_tags(out_path, ext, title)
+    cover_ok = cover_embedded(out_path, ext)
+    if not cover_ok and not warning:
+        warning = f"{ext} format me cover embed nahi ho sakta (chat thumbnail phir bhi lagega)"
 
     return {
+        "cover_ok": cover_ok,
         "path": out_path,
         "name": out_name,
         "title": title,
@@ -521,6 +592,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      if result["source"] == "metadata"
                      else "file name se banaya gaya title")
         caption = f"✅ {result['title']}\n({src_label})"
+        caption += "\ncover: " + ("✅ embedded" if result["cover_ok"] else "❌ file me nahi")
         if result["ext_fixed"]:
             caption += f"\nextension fixed → {result['ext']}"
         if result["warning"]:
@@ -542,15 +614,16 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             write_timeout=120,
             connect_timeout=30,
         )
+        thumb_bytes = get_thumbnail_bytes() or None
         try:
-            with open(result["path"], "rb") as fh, open(ALPHA_COVER_IMAGE, "rb") as thumb:
+            with open(result["path"], "rb") as fh:
                 await message.reply_audio(
                     audio=fh,
                     filename=result["name"],
                     title=result["title"],
                     performer=ALPHA_ARTIST_NAME,
                     duration=duration,
-                    thumbnail=thumb,
+                    thumbnail=thumb_bytes,
                     **send_kwargs,
                 )
         except TelegramError as audio_err:
@@ -559,6 +632,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_document(
                     document=fh,
                     filename=result["name"],
+                    thumbnail=thumb_bytes,
                     **send_kwargs,
                 )
 
